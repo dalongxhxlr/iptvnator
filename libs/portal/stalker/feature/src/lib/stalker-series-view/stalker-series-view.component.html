@@ -1,0 +1,116 @@
+@if (displayItem(); as serial) {
+    <app-content-hero
+        [title]="serial.info.name"
+        [description]="serial.info.description"
+        [posterUrl]="serial.info.movie_image"
+        (backClicked)="goBack()"
+    >
+        <!-- Tags: Year, Genre, Rating -->
+        <ng-container hero-tags>
+            @if (serial.info.releasedate) {
+                <span class="details__tag">{{ serial.info.releasedate }}</span>
+            }
+            @if (serial.info.genre) {
+                <span class="details__tag">{{ serial.info.genre }}</span>
+            }
+            @if (serial.info.rating_imdb) {
+                <span class="details__tag details__tag--rating">
+                    ⭐ {{ serial.info.rating_imdb }}
+                </span>
+            }
+            @if (serial.info.rating_kinopoisk) {
+                <span class="details__tag">
+                    KP {{ serial.info.rating_kinopoisk }}
+                </span>
+            }
+        </ng-container>
+
+        <!-- Metadata Grid -->
+        <ng-container hero-meta>
+            @if (serial.info.actors) {
+                <div class="details__meta-item">
+                    <span class="label">{{ 'XTREAM.ACTORS' | translate }}</span>
+                    <span class="value">{{ serial.info.actors }}</span>
+                </div>
+            }
+            @if (serial.info.director) {
+                <div class="details__meta-item">
+                    <span class="label">{{
+                        'XTREAM.DIRECTOR' | translate
+                    }}</span>
+                    <span class="value">{{ serial.info.director }}</span>
+                </div>
+            }
+        </ng-container>
+
+        <!-- Action Buttons -->
+        <ng-container hero-actions>
+            @if (quickStartAction(); as action) {
+                <button
+                    class="play-btn"
+                    data-testid="series-quick-start"
+                    (click)="playQuickStartEpisode()"
+                    [disabled]="action.disabled"
+                >
+                    <span class="play-btn__icon-shell" aria-hidden="true">
+                        <mat-icon class="play-btn__icon">{{
+                            action.icon
+                        }}</mat-icon>
+                    </span>
+                    <span class="play-btn__copy">
+                        <span class="play-btn__label">
+                            {{ action.labelKey | translate }}
+                        </span>
+                        @if (action.episodeLabel) {
+                            <span class="play-btn__meta">
+                                {{ action.episodeLabel }}
+                            </span>
+                        }
+                    </span>
+                </button>
+            }
+            <app-favorites-button [itemId]="serial.id" [item]="serial" />
+        </ng-container>
+
+        @if (inlinePlayback(); as playback) {
+            <app-portal-inline-player
+                [playback]="playback"
+                [episodeMetadata]="inlineEpisodeMetadata()"
+                [seriesNavigation]="inlineSeriesNavigation()"
+                (timeUpdate)="handleInlineTimeUpdate($event)"
+                (closed)="closeInlinePlayer()"
+                (streamUrlCopied)="showCopyNotification()"
+                (playbackEnded)="handleInlinePlaybackEnded()"
+                (previousEpisodeRequested)="playPreviousEpisode()"
+                (nextEpisodeRequested)="playNextEpisode()"
+                (externalFallbackRequested)="
+                    handleExternalFallbackRequest($event)
+                "
+            />
+        }
+
+        <!-- Seasons & Episodes -->
+        @if (mappedSeasons()) {
+            <app-season-container
+                [seasons]="mappedSeasons()"
+                [seriesId]="toSeriesId(serial.id)"
+                [playlistId]="stalkerStore.currentPlaylist()?._id ?? ''"
+                [seriesTitle]="serial.info.name"
+                [playbackPositions]="episodePlaybackPositions()"
+                [openingEpisodeId]="openingEpisodeId()"
+                [activeEpisodeId]="activeEpisodeId()"
+                [isLoading]="
+                    isVodSeriesSeasonsLoading() ||
+                    isCurrentSeasonLoading(seasonContainer?.selectedSeason)
+                "
+                (seasonSelected)="onSeasonSelected($event)"
+                (episodeClicked)="onEpisodeClicked($event)"
+                (episodeDownloadRequested)="downloadEpisode($event)"
+                (playbackToggleRequested)="
+                    handlePlaybackToggleRequested($event)
+                "
+                #seasonContainer
+            />
+        }
+    </app-content-hero>
+}

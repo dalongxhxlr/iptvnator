@@ -1,0 +1,703 @@
+name: Build and Make Electron App
+
+on:
+    push:
+        branches:
+            - master
+        tags:
+            - 'v*.*.*'
+    pull_request:
+        branches:
+            - master
+    workflow_dispatch:
+
+jobs:
+    build:
+        name: Build on ${{ matrix.os }} ${{ matrix.arch }}
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 120
+        strategy:
+            matrix:
+                include:
+                    # macOS builds - separate runners to avoid native module conflicts
+                    - os: macos
+                      runner: macos-15-intel
+                      arch: x64
+                      embedded_mpv_platform: darwin
+                      embedded_mpv_arch: x64
+                      embedded_mpv_build_runtime: true
+                    - os: macos
+                      runner: macos-latest
+                      arch: arm64
+                      embedded_mpv_platform: darwin
+                      embedded_mpv_arch: arm64
+                      embedded_mpv_build_runtime: true
+                    # Linux and Windows
+                    - os: linux
+                      runner: ubuntu-22.04
+                      linux_profile: standard
+                      embedded_mpv_platform: linux
+                      embedded_mpv_arch: x64
+                      embedded_mpv_build_runtime: false
+                    - os: linux
+                      runner: ubuntu-24.04
+                      linux_profile: flatpak
+                      embedded_mpv_platform: linux
+                      embedded_mpv_arch: x64
+                      embedded_mpv_build_runtime: false
+                    - os: windows
+                      runner: windows-2022
+                      embedded_mpv_platform: win32
+                      embedded_mpv_arch: x64
+                      embedded_mpv_build_runtime: false
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+                  cache: 'pnpm'
+
+            - name: Install Linux system dependencies
+              if: matrix.os == 'linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --no-install-recommends -y rpm libarchive-tools flatpak flatpak-builder appstream libx11-dev libxext-dev libmpv-dev mpv pkg-config
+
+                  # Configure Flatpak
+                  # 1. Add the Flathub repository (source of runtimes)
+                  flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+
+                  # 2. Install the standard Freedesktop Platform and SDK (required by electron-builder)
+                  # We install version 24.08 as a safe default, electron-builder might pick what it needs
+                  flatpak install --user -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
+            - name: Select Linux packaging targets for CI profile
+              if: matrix.os == 'linux'
+              run: |
+                  node -e "
+                    const fs = require('fs');
+                    const path = 'electron-builder.json';
+                    const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+                    const targets = Array.isArray(config.linux?.target) ? config.linux.target : [];
+                    const profile = '${{ matrix.linux_profile }}';
+
+                    if (profile === 'standard') {
+                      config.linux.target = targets.filter((entry) => String(entry.target).toLowerCase() !== 'flatpak');
+                    } else if (profile === 'flatpak') {
+                      config.linux.target = targets.filter((entry) => String(entry.target).toLowerCase() === 'flatpak');
+                    }
+
+                    fs.writeFileSync(path, JSON.stringify(config, null, 4) + '\n');
+                  "
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build frontend
+              run: pnpm nx build web --skip-nx-cache
+
+            - name: Resolve embedded MPV runtime cache key
+              # TEMPORARY ARTIFACT TEST: remove `|| github.event_name == 'pull_request' || github.ref == 'refs/heads/master'`
+              # after the macOS Embedded MPV artifacts are built and manually tested.
+              if: matrix.embedded_mpv_platform && !startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'pull_request' || github.ref == 'refs/heads/master')
+              id: embedded-mpv-runtime-cache-key
+              shell: bash
+              env:
+                  IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256: ${{ vars.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 || secrets.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 || '' }}
+                  IPTVNATOR_DEFAULT_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256: a26e28fa55c15ac5b6209d8a9f9c3c8cb39649631a53d3c4774beeae559a078c
+              run: |
+                  set -euo pipefail
+
+                  node <<'NODE'
+                  const childProcess = require('child_process');
+                  const crypto = require('crypto');
+                  const fs = require('fs');
+
+                  const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
+                  const targetPlatform = '${{ matrix.embedded_mpv_platform }}';
+                  const targetArch = '${{ matrix.embedded_mpv_arch }}';
+                  const sourceHashFiles = [
+                    'tools/embedded-mpv/stage-runtime.mjs',
+                  ];
+                  const cacheKeyParts = [
+                    'embedded-mpv-runtime-v2',
+                    targetPlatform,
+                    targetArch,
+                    process.env.RUNNER_OS,
+                  ];
+                  let deploymentTarget = '';
+                  let xcodeVersion = 'none';
+                  if (targetPlatform === 'darwin') {
+                    deploymentTarget = process.env.MACOSX_DEPLOYMENT_TARGET || '11.0';
+                    const safeDeploymentTarget = deploymentTarget.replace(/[^A-Za-z0-9_.-]/g, '-');
+                    sourceHashFiles.push(
+                      'tools/embedded-mpv/build-macos-runtime.mjs',
+                      'tools/embedded-mpv/stage-macos-runtime.mjs'
+                    );
+                    try {
+                      xcodeVersion = childProcess
+                        .execSync('xcodebuild -version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+                        .replace(/\s+$/g, '')
+                        .replace(/\n/g, ' ');
+                    } catch {
+                      xcodeVersion = 'none';
+                    }
+                    cacheKeyParts.push(
+                      `macos${safeDeploymentTarget}`,
+                      `xcode${hash(xcodeVersion)}`
+                    );
+                  } else if (targetPlatform === 'win32') {
+                    sourceHashFiles.push('tools/embedded-mpv/stage-windows-runtime-archive.mjs');
+                    const windowsRuntimeSha256 =
+                      process.env.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 ||
+                      process.env.IPTVNATOR_DEFAULT_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 ||
+                      'missing';
+                    cacheKeyParts.push(
+                      `runtime${hash(windowsRuntimeSha256)}`
+                    );
+                  }
+                  const sourceHash = hash(
+                    sourceHashFiles.map((filePath) => fs.readFileSync(filePath)).join('\n')
+                  );
+                  cacheKeyParts.push(sourceHash);
+                  const cacheKey = cacheKeyParts.join('-');
+
+                  fs.appendFileSync(process.env.GITHUB_OUTPUT, `deployment-target=${deploymentTarget}\n`);
+                  fs.appendFileSync(process.env.GITHUB_OUTPUT, `xcode-version=${xcodeVersion}\n`);
+                  fs.appendFileSync(process.env.GITHUB_OUTPUT, `key=${cacheKey}\n`);
+                  console.log(`Embedded MPV runtime cache key: ${cacheKey}`);
+                  console.log(`Xcode version: ${xcodeVersion}`);
+                  NODE
+
+            - name: Restore embedded MPV runtime cache
+              # TEMPORARY ARTIFACT TEST: remove `|| github.event_name == 'pull_request' || github.ref == 'refs/heads/master'`
+              # after the macOS Embedded MPV artifacts are built and manually tested.
+              if: matrix.embedded_mpv_platform && !startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'pull_request' || github.ref == 'refs/heads/master')
+              id: embedded-mpv-runtime-cache
+              uses: actions/cache/restore@v4
+              with:
+                  path: |
+                      vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/include
+                      vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/lib
+                      vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/runtime-manifest.json
+                  key: ${{ steps.embedded-mpv-runtime-cache-key.outputs.key }}
+
+            - name: Clear stale embedded MPV runtime files
+              # TEMPORARY ARTIFACT TEST: remove `|| github.event_name == 'pull_request' || github.ref == 'refs/heads/master'`
+              # after the macOS Embedded MPV artifacts are built and manually tested.
+              if: matrix.embedded_mpv_platform && !startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'pull_request' || github.ref == 'refs/heads/master') && steps.embedded-mpv-runtime-cache.outputs.cache-hit != 'true'
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  rm -rf \
+                      "vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/include" \
+                      "vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/lib" \
+                      "vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/runtime-manifest.json"
+
+            - name: Build embedded MPV runtime (macOS release)
+              # TEMPORARY ARTIFACT TEST: remove `|| github.event_name == 'pull_request' || github.ref == 'refs/heads/master'`
+              # after the macOS Embedded MPV artifacts are built and manually tested.
+              if: matrix.embedded_mpv_build_runtime && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request' || github.ref == 'refs/heads/master') && steps.embedded-mpv-runtime-cache.outputs.cache-hit != 'true'
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  brew install meson ninja pkg-config nasm autoconf automake libtool xz
+
+                  RUNTIME_PREFIX="${RUNNER_TEMP}/embedded-mpv-runtime/${{ matrix.embedded_mpv_arch }}/prefix"
+                  pnpm embedded-mpv:build-runtime -- "${{ matrix.embedded_mpv_arch }}" "${RUNTIME_PREFIX}"
+                  pnpm embedded-mpv:stage-runtime -- "${{ matrix.embedded_mpv_platform }}" "${{ matrix.embedded_mpv_arch }}" "${RUNTIME_PREFIX}"
+
+            - name: Stage Windows embedded MPV runtime archive
+              if: matrix.os == 'windows' && steps.embedded-mpv-runtime-cache.outputs.cache-hit != 'true'
+              shell: bash
+              env:
+                  IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_URL: ${{ vars.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_URL || secrets.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_URL || '' }}
+                  IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256: ${{ vars.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 || secrets.IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 || '' }}
+                  IPTVNATOR_DEFAULT_WINDOWS_EMBEDDED_MPV_RUNTIME_URL: https://github.com/zhongfly/mpv-winbuild/releases/download/2026-06-14-7d245fd100/mpv-dev-lgpl-x86_64-20260614-git-7d245fd100.7z
+                  IPTVNATOR_DEFAULT_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256: a26e28fa55c15ac5b6209d8a9f9c3c8cb39649631a53d3c4774beeae559a078c
+              run: |
+                  set -euo pipefail
+
+                  WINDOWS_RUNTIME_URL="${IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_URL}"
+                  WINDOWS_RUNTIME_SHA256="${IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256}"
+                  if [ -z "${WINDOWS_RUNTIME_URL}" ] && [ -z "${WINDOWS_RUNTIME_SHA256}" ]; then
+                      case "${GITHUB_REF}" in
+                          refs/tags/v*)
+                              ;;
+                          *)
+                              WINDOWS_RUNTIME_URL="${IPTVNATOR_DEFAULT_WINDOWS_EMBEDDED_MPV_RUNTIME_URL}"
+                              WINDOWS_RUNTIME_SHA256="${IPTVNATOR_DEFAULT_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256}"
+                              ;;
+                      esac
+                  fi
+
+                  if [ -z "${WINDOWS_RUNTIME_URL}" ] || [ -z "${WINDOWS_RUNTIME_SHA256}" ]; then
+                      echo "::error::Windows Embedded MPV CI requires IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_URL and IPTVNATOR_WINDOWS_EMBEDDED_MPV_RUNTIME_SHA256 repository variables or secrets."
+                      exit 1
+                  fi
+
+                  pnpm embedded-mpv:stage-runtime:windows-archive -- "${WINDOWS_RUNTIME_URL}" "${WINDOWS_RUNTIME_SHA256}"
+
+            - name: Stage Linux embedded MPV build inputs
+              if: matrix.os == 'linux'
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  RUNTIME_PREFIX="${RUNNER_TEMP}/embedded-mpv-runtime/linux-x64/prefix"
+                  rm -rf "${RUNTIME_PREFIX}"
+                  mkdir -p "${RUNTIME_PREFIX}/include"
+
+                  cp -a /usr/include/mpv "${RUNTIME_PREFIX}/include/"
+
+                  LIBMPV_DEV_VERSION="$(dpkg-query -W -f='${Version}' libmpv-dev)"
+                  MPV_VERSION="$(dpkg-query -W -f='${Version}' mpv)"
+                  export RUNTIME_PREFIX LIBMPV_DEV_VERSION MPV_VERSION
+                  node <<'NODE'
+                  const fs = require('fs');
+                  const path = require('path');
+
+                  const manifest = {
+                    linuxBackend: 'process-isolated mpv --wid',
+                    buildInputs: {
+                      libmpvDevPackage: process.env.LIBMPV_DEV_VERSION,
+                      mpvPackage: process.env.MPV_VERSION,
+                    },
+                    sourceDistribution:
+                      'Linux CI build inputs come from Ubuntu runner packages. Runtime playback uses the system mpv executable; IPTVnator does not bundle or load libmpv in the Electron process on Linux.',
+                  };
+
+                  fs.writeFileSync(
+                    path.join(process.env.RUNTIME_PREFIX, 'runtime-manifest.json'),
+                    `${JSON.stringify(manifest, null, 2)}\n`
+                  );
+                  NODE
+
+                  pnpm embedded-mpv:stage-runtime -- linux x64 "${RUNTIME_PREFIX}"
+
+            - name: Build backend
+              env:
+                  IPTVNATOR_EMBEDDED_MPV_PLATFORM: ${{ matrix.embedded_mpv_platform || '' }}
+                  IPTVNATOR_EMBEDDED_MPV_ARCH: ${{ matrix.embedded_mpv_arch || matrix.arch || '' }}
+                  IPTVNATOR_REQUIRE_EMBEDDED_MPV: ${{ (matrix.os == 'linux' || matrix.os == 'windows' || (matrix.os == 'macos' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request' || github.ref == 'refs/heads/master'))) && '1' || '0' }}
+              run: pnpm run build:backend
+
+            - name: Verify embedded MPV build output
+              # TEMPORARY ARTIFACT TEST: remove `|| github.event_name == 'pull_request' || github.ref == 'refs/heads/master'`
+              # after the macOS Embedded MPV artifacts are built and manually tested.
+              if: matrix.os == 'linux' || matrix.os == 'windows' || (matrix.os == 'macos' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request' || github.ref == 'refs/heads/master'))
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  echo "::group::Native build output"
+                  find apps/electron-backend/native/build/Release -maxdepth 3 -type f | sort
+                  echo "::endgroup::"
+
+                  echo "::group::Dist native output"
+                  find dist/apps/electron-backend/native -maxdepth 3 -type f | sort
+                  echo "::endgroup::"
+
+                  test -f apps/electron-backend/native/build/Release/embedded_mpv.node
+                  test -f dist/apps/electron-backend/native/embedded_mpv.node
+                  test -f dist/apps/electron-backend/native/embedded-mpv-runtime.json
+                  case "${{ matrix.embedded_mpv_platform }}" in
+                    darwin)
+                      test -f dist/apps/electron-backend/native/lib/libmpv.2.dylib || test -f dist/apps/electron-backend/native/lib/libmpv.dylib
+                      ;;
+                    win32)
+                      test -f dist/apps/electron-backend/native/lib/mpv-2.dll || test -f dist/apps/electron-backend/native/lib/libmpv-2.dll || test -f dist/apps/electron-backend/native/lib/mpv.dll || test -f dist/apps/electron-backend/native/lib/libmpv.dll
+                      ;;
+                    linux)
+                      node -e "const manifest = require('./dist/apps/electron-backend/native/embedded-mpv-runtime.json'); if (manifest.origin !== 'external-mpv-process') { throw new Error('Linux embedded MPV manifest must use external-mpv-process origin.'); }"
+                      if find dist/apps/electron-backend/native/lib -name 'libmpv.so*' -print -quit 2>/dev/null | grep -q .; then
+                          echo "::error::Linux embedded MPV packages must not bundle libmpv"
+                          find dist/apps/electron-backend/native/lib -name 'libmpv.so*' -print
+                          exit 1
+                      fi
+                      if ldd dist/apps/electron-backend/native/embedded_mpv.node | grep -q 'libmpv'; then
+                          echo "::error::Linux embedded MPV addon must not link directly to libmpv"
+                          ldd dist/apps/electron-backend/native/embedded_mpv.node
+                          exit 1
+                      fi
+                      ;;
+                  esac
+
+            - name: Validate AppStream metadata
+              if: matrix.os == 'linux'
+              run: appstreamcli validate --pedantic --no-net apps/electron-backend/linux/com.fourgray.iptvnator.metainfo.xml
+
+            - name: Build website
+              if: matrix.os == 'linux'
+              run: pnpm nx build website --skip-nx-cache
+
+            - name: Verify AppStream website assets
+              if: matrix.os == 'linux'
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  for screenshot in player playlists epg settings; do
+                      if ! find dist/apps/website -path "*/appstream/${screenshot}.png" -print -quit | grep -q .; then
+                          echo "::error::Missing AppStream website asset for ${screenshot}.png"
+                          exit 1
+                      fi
+                  done
+
+            - name: Override macOS arch in electron-builder.json
+              if: matrix.os == 'macos'
+              run: |
+                  # Replace the mac arch array with just the target architecture
+                  node -e "
+                    const fs = require('fs');
+                    const pkg = JSON.parse(fs.readFileSync('electron-builder.json', 'utf8'));
+                    pkg.mac.target.arch = ['${{ matrix.arch }}'];
+                    fs.writeFileSync('electron-builder.json', JSON.stringify(pkg, null, 4));
+                  "
+
+            - name: Override Windows arch in electron-builder.json
+              if: matrix.os == 'windows'
+              run: |
+                  node -e "
+                    const fs = require('fs');
+                    const pkg = JSON.parse(fs.readFileSync('electron-builder.json', 'utf8'));
+                    const targets = Array.isArray(pkg.win?.target) ? pkg.win.target : [];
+                    for (const target of targets) {
+                      if (target && typeof target === 'object') {
+                        target.arch = ['${{ matrix.embedded_mpv_arch }}'];
+                      }
+                    }
+                    fs.writeFileSync('electron-builder.json', JSON.stringify(pkg, null, 4) + '\n');
+                  "
+
+            - name: Validate macOS signing configuration
+              if: matrix.os == 'macos' && github.event_name != 'pull_request'
+              shell: bash
+              env:
+                  CSC_NAME: ${{ vars.CSC_NAME }}
+                  CSC_LINK: ${{ secrets.CSC_LINK }}
+                  CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+                  APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
+                  APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+                  APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+                  APPLE_ID: ${{ secrets.APPLE_ID }}
+                  APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+                  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+              run: |
+                  if [ -z "${CSC_NAME}" ]; then
+                      echo "::error::Missing CSC_NAME repository variable for deterministic macOS code signing."
+                      exit 1
+                  fi
+
+                  if [ -z "${CSC_LINK}" ] || [ -z "${CSC_KEY_PASSWORD}" ]; then
+                      echo "::error::Missing CSC_LINK or CSC_KEY_PASSWORD secret for macOS code signing."
+                      exit 1
+                  fi
+
+                  has_api_key_credentials=false
+                  if [ -n "${APPLE_API_KEY_CONTENT}" ] || [ -n "${APPLE_API_KEY_ID}" ] || [ -n "${APPLE_API_ISSUER}" ]; then
+                      if [ -z "${APPLE_API_KEY_CONTENT}" ] || [ -z "${APPLE_API_KEY_ID}" ] || [ -z "${APPLE_API_ISSUER}" ]; then
+                          echo "::error::APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER must all be set for App Store Connect API key notarization."
+                          exit 1
+                      fi
+                      has_api_key_credentials=true
+                  fi
+
+                  has_apple_id_credentials=false
+                  if [ -n "${APPLE_ID}" ] || [ -n "${APPLE_APP_SPECIFIC_PASSWORD}" ] || [ -n "${APPLE_TEAM_ID}" ]; then
+                      if [ -z "${APPLE_ID}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD}" ] || [ -z "${APPLE_TEAM_ID}" ]; then
+                          echo "::error::APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID must all be set for Apple ID notarization."
+                          exit 1
+                      fi
+                      has_apple_id_credentials=true
+                  fi
+
+                  if [ "${has_api_key_credentials}" = false ] && [ "${has_apple_id_credentials}" = false ]; then
+                      echo "::error::Missing notarization credentials. Configure either APPLE_API_KEY + APPLE_API_KEY_ID + APPLE_API_ISSUER, or APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID."
+                      exit 1
+                  fi
+
+            - name: Prepare macOS notarization credentials
+              if: matrix.os == 'macos' && github.event_name != 'pull_request'
+              shell: bash
+              env:
+                  APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
+                  APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+                  APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+                  APPLE_ID: ${{ secrets.APPLE_ID }}
+                  APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+                  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+              run: |
+                  if [ -n "${APPLE_API_KEY_CONTENT}" ]; then
+                      APPLE_API_KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+                      printf '%s' "${APPLE_API_KEY_CONTENT}" > "${APPLE_API_KEY_PATH}"
+                      chmod 600 "${APPLE_API_KEY_PATH}"
+                      echo "APPLE_API_KEY=${APPLE_API_KEY_PATH}" >> "${GITHUB_ENV}"
+                      echo "APPLE_API_KEY_ID=${APPLE_API_KEY_ID}" >> "${GITHUB_ENV}"
+                      echo "APPLE_API_ISSUER=${APPLE_API_ISSUER}" >> "${GITHUB_ENV}"
+                      echo "APPLE_ID=" >> "${GITHUB_ENV}"
+                      echo "APPLE_APP_SPECIFIC_PASSWORD=" >> "${GITHUB_ENV}"
+                      echo "APPLE_TEAM_ID=" >> "${GITHUB_ENV}"
+                      exit 0
+                  fi
+
+                  if [ -n "${APPLE_ID}" ]; then
+                      echo "APPLE_API_KEY=" >> "${GITHUB_ENV}"
+                      echo "APPLE_API_KEY_ID=" >> "${GITHUB_ENV}"
+                      echo "APPLE_API_ISSUER=" >> "${GITHUB_ENV}"
+                      echo "APPLE_ID=${APPLE_ID}" >> "${GITHUB_ENV}"
+                      echo "APPLE_APP_SPECIFIC_PASSWORD=${APPLE_APP_SPECIFIC_PASSWORD}" >> "${GITHUB_ENV}"
+                      echo "APPLE_TEAM_ID=${APPLE_TEAM_ID}" >> "${GITHUB_ENV}"
+                  fi
+
+            - name: Make Electron app (macOS)
+              if: matrix.os == 'macos' && github.event_name != 'pull_request'
+              env:
+                  CSC_NAME: ${{ vars.CSC_NAME }}
+                  CSC_LINK: ${{ secrets.CSC_LINK }}
+                  CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+                  DEBUG: electron-builder,electron-notarize*
+                  IPTVNATOR_EMBEDDED_MPV_PLATFORM: ${{ matrix.embedded_mpv_platform }}
+                  IPTVNATOR_EMBEDDED_MPV_ARCH: ${{ matrix.embedded_mpv_arch }}
+                  # TEMPORARY MASTER ARTIFACT TEST: remove `|| github.ref == 'refs/heads/master'`
+                  # after the macOS Embedded MPV artifacts are built and manually tested.
+                  IPTVNATOR_REQUIRE_EMBEDDED_MPV: ${{ (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master') && '1' || '0' }}
+              run: pnpm run make:app
+
+            - name: Verify signed macOS app
+              if: matrix.os == 'macos' && github.event_name != 'pull_request'
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  case "${{ matrix.arch }}" in
+                      x64)
+                          APP_PATH="dist/executables/mac/IPTVnator.app"
+                          ;;
+                      arm64)
+                          APP_PATH="dist/executables/mac-arm64/IPTVnator.app"
+                          ;;
+                      *)
+                          echo "::error::Unsupported macOS arch: ${{ matrix.arch }}"
+                          exit 1
+                          ;;
+                  esac
+
+                  print_debug_attrs() {
+                      echo "::group::Extended attributes"
+                      xattr -lr "${APP_PATH}" | sed -n '1,120p' || true
+                      echo "::endgroup::"
+                  }
+
+                  trap print_debug_attrs ERR
+
+                  if [ ! -d "${APP_PATH}" ]; then
+                      echo "::error::Expected app bundle not found at ${APP_PATH}"
+                      exit 1
+                  fi
+
+                  SIGNATURE_INFO="$(codesign -dv --verbose=4 "${APP_PATH}" 2>&1)"
+                  printf '%s\n' "${SIGNATURE_INFO}"
+
+                  if printf '%s\n' "${SIGNATURE_INFO}" | grep -q 'Signature=adhoc'; then
+                      echo "::error::macOS app is still ad-hoc signed."
+                      exit 1
+                  fi
+
+                  if printf '%s\n' "${SIGNATURE_INFO}" | grep -q 'TeamIdentifier=not set'; then
+                      echo "::error::macOS app is missing a TeamIdentifier."
+                      exit 1
+                  fi
+
+                  codesign --verify --deep --strict --verbose=4 "${APP_PATH}"
+                  spctl -a -vvv --type execute "${APP_PATH}"
+                  xcrun stapler validate "${APP_PATH}"
+
+            - name: Make Electron app
+              if: matrix.os != 'macos' || github.event_name == 'pull_request'
+              env:
+                  IPTVNATOR_EMBEDDED_MPV_PLATFORM: ${{ matrix.embedded_mpv_platform || '' }}
+                  IPTVNATOR_EMBEDDED_MPV_ARCH: ${{ matrix.embedded_mpv_arch || matrix.arch || '' }}
+                  # TEMPORARY PR TEST: change this back to '0' after manually
+                  # testing the macOS PR artifact with Embedded MPV included.
+                  IPTVNATOR_REQUIRE_EMBEDDED_MPV: ${{ (matrix.os == 'linux' || matrix.os == 'windows' || (matrix.os == 'macos' && github.event_name == 'pull_request')) && '1' || '0' }}
+              run: pnpm run make:app
+
+            - name: Verify packaged worker layout
+              shell: bash
+              env:
+                  PACKAGE_OS: ${{ matrix.os }}
+                  PACKAGE_ARCH: ${{ matrix.arch || matrix.embedded_mpv_arch || '' }}
+                  # TEMPORARY ARTIFACT TEST: remove `|| github.event_name == 'pull_request' || github.ref == 'refs/heads/master'`
+                  # after the macOS Embedded MPV artifacts are built and manually tested.
+                  IPTVNATOR_REQUIRE_EMBEDDED_MPV: ${{ (matrix.os == 'linux' || matrix.os == 'windows' || (matrix.os == 'macos' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request' || github.ref == 'refs/heads/master'))) && '1' || '0' }}
+              run: pnpm run verify:package-layout -- "$PACKAGE_OS" "$PACKAGE_ARCH"
+
+            - name: Save embedded MPV runtime cache
+              # TEMPORARY ARTIFACT TEST: remove `|| github.ref == 'refs/heads/master'`
+              # after the macOS Embedded MPV artifacts are built and manually tested.
+              if: matrix.embedded_mpv_platform && matrix.os != 'linux' && !startsWith(github.ref, 'refs/tags/v') && github.repository == '4gray/iptvnator' && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && steps.embedded-mpv-runtime-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v4
+              with:
+                  path: |
+                      vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/include
+                      vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/lib
+                      vendor/embedded-mpv/${{ matrix.embedded_mpv_platform }}-${{ matrix.embedded_mpv_arch }}/runtime-manifest.json
+                  key: ${{ steps.embedded-mpv-runtime-cache-key.outputs.key }}
+
+            - name: Smoke test packaged Flatpak launcher
+              if: matrix.os == 'linux' && matrix.linux_profile == 'flatpak'
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  FLATPAK_BUNDLE="$(find dist/executables -maxdepth 1 -name '*.flatpak' | head -n 1)"
+                  if [ -z "${FLATPAK_BUNDLE}" ]; then
+                      echo "::error::Flatpak bundle not found in dist/executables"
+                      exit 1
+                  fi
+
+                  flatpak install --user --noninteractive -y "${FLATPAK_BUNDLE}"
+                  flatpak run --command=sh com.fourgray.iptvnator -c '
+                      set -euo pipefail
+
+                      test -f /app/share/metainfo/com.fourgray.iptvnator.metainfo.xml
+                      test -L /app/bin/iptvnator
+
+                      LAUNCHER_PATH="$(readlink -f /app/bin/iptvnator)"
+                      test -f "${LAUNCHER_PATH}"
+                      test -f "${LAUNCHER_PATH}.bin"
+                      grep -q '\''readlink -f "$SCRIPT_PATH"'\'' "${LAUNCHER_PATH}"
+                      grep -q '\''exec "$SCRIPT_DIR/iptvnator.bin"'\'' "${LAUNCHER_PATH}"
+                  '
+
+            - name: Upload artifacts (macOS)
+              if: matrix.os == 'macos'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: macos-${{ matrix.arch }}-artifacts
+                  path: |
+                      dist/executables/**/*.dmg
+                      dist/executables/**/*.zip
+                  retention-days: 7
+
+            - name: Upload artifacts (Linux)
+              if: matrix.os == 'linux' && matrix.linux_profile == 'standard'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-artifacts
+                  path: |
+                      dist/executables/**/*.deb
+                      dist/executables/**/*.rpm
+                      dist/executables/**/*.snap
+                      dist/executables/**/*.AppImage
+                      dist/executables/**/*.tar.gz
+                      dist/executables/**/*.pacman
+                  retention-days: 7
+
+            - name: Upload artifacts (Flatpak)
+              if: matrix.os == 'linux' && matrix.linux_profile == 'flatpak'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-flatpak-artifacts
+                  path: |
+                      dist/executables/**/*.flatpak
+                  retention-days: 7
+
+            - name: Upload artifacts (Windows)
+              if: matrix.os == 'windows'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-artifacts
+                  path: |
+                      dist/executables/**/*.exe
+                      dist/executables/**/*.msi
+                      dist/executables/**/*.zip
+                  retention-days: 7
+
+    create-release:
+        name: Create Draft Release
+        needs: build
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: artifacts
+
+            - name: Display structure of downloaded files
+              run: ls -R artifacts
+
+            - name: Get version from package.json
+              id: package-version
+              run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+            - name: Create Draft Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  draft: true
+                  prerelease: ${{ github.event_name == 'pull_request' }}
+                  name: Release v${{ steps.package-version.outputs.version }}
+                  tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('test-{0}', github.sha) }}
+                  generate_release_notes: true
+                  files: |
+                      artifacts/macos-x64-artifacts/*-x64.dmg
+                      artifacts/macos-x64-artifacts/*-x64.zip
+                      artifacts/macos-arm64-artifacts/*-arm64.dmg
+                      artifacts/macos-arm64-artifacts/*-arm64.zip
+                      artifacts/linux-artifacts/*.AppImage
+                      artifacts/linux-artifacts/*.deb
+                      artifacts/linux-artifacts/*.rpm
+                      artifacts/linux-artifacts/*.snap
+                      artifacts/linux-artifacts/*.tar.gz
+                      artifacts/linux-artifacts/*.pacman
+                      artifacts/linux-flatpak-artifacts/*.flatpak
+                      artifacts/windows-artifacts/*-setup.exe
+                      artifacts/windows-artifacts/*.msi
+                      artifacts/windows-artifacts/*.zip
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    publish-snap:
+        name: Publish to Snapcraft Store
+        needs: build
+        runs-on: ubuntu-latest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+            SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.snapcraft_token }}
+
+        steps:
+            - name: Download snap artifact
+              uses: actions/download-artifact@v4
+              with:
+                  name: linux-artifacts
+                  path: artifacts
+
+            - name: Setup Snapcraft
+              uses: samuelmeuli/action-snapcraft@v3
+
+            - name: Publish all snaps to edge channel
+              run: |
+                  # Find and publish all snap files
+                  for SNAP_FILE in artifacts/*.snap; do
+                      if [ -f "$SNAP_FILE" ]; then
+                          echo "Publishing: $SNAP_FILE"
+                          snapcraft upload --release=edge "$SNAP_FILE"
+                      fi
+                  done

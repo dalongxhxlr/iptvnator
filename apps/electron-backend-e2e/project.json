@@ -1,0 +1,20 @@
+{
+    "name": "electron-backend-e2e",
+    "$schema": "../../node_modules/nx/schemas/project-schema.json",
+    "projectType": "application",
+    "sourceRoot": "apps/electron-backend-e2e/src",
+    "implicitDependencies": [
+        "electron-backend",
+        "stalker-mock-server",
+        "xtream-mock-server"
+    ],
+    "targets": {
+        "e2e": {
+            "dependsOn": ["electron-backend:build-e2e"]
+        },
+        "lint": {
+            "executor": "@nx/eslint:lint"
+        }
+    },
+    "tags": ["scope:e2e", "domain:electron-main", "type:e2e"]
+}
